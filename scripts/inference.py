@@ -4,6 +4,30 @@ from peft import PeftModel
 import yaml
 import json
 import sys
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Initialize global inference manager
+_inference_manager = None
+
+def get_inference_manager():
+    """Get or create the inference manager singleton."""
+    global _inference_manager
+    if _inference_manager is None:
+        model, tokenizer = load_model_and_tokenizer()
+        _inference_manager = InferenceManager(model, "cuda" if torch.cuda.is_available() else "cpu")
+    return _inference_manager
+
+def generate_response(prompt, history=None, max_length=4096, temperature=0.7,
+                     top_p=0.95, top_k=50, repetition_penalty=1.1, min_length=20,
+                     max_new_tokens=1024):
+    """Standalone function to generate responses using the inference manager."""
+    manager = get_inference_manager()
+    return manager.generate_response(
+        prompt, history, max_length, temperature, top_p, top_k,
+        repetition_penalty, min_length, max_new_tokens
+    )
 
 def load_config(config_path: str = "config/train_config.yaml") -> dict:
     """Load training configuration."""
@@ -78,50 +102,71 @@ def clean_response(response: str) -> str:
     response = response.replace("<||system||>", "").replace("<|user|}{assistant}|", "")
     response = response.replace("<||assistant---", "").replace("|>", "")
     
-    # Remove URLs and technical content
-    if "http://" in response or "https://" in response:
+    # Remove URLs and technical content - but be less aggressive
+    # Only remove URLs if they appear to be incomplete or malformed
+    if "http://" in response and not response.endswith("http://"):
         response = response.split("http://")[0].strip()
+    if "https://" in response and not response.endswith("https://"):
+        response = response.split("https://")[0].strip()
     
     return response
 
-def generate_response(model, tokenizer, prompt, max_length=2048):
-    """Generate a response for the given prompt."""
-    try:
-        # System prompt to guide the model's behavior
-        system_prompt = """You are Raadhe, a helpful and friendly AI assistant. 
-        You should provide clear, concise, and relevant responses. 
-        Always be polite and professional."""
+class InferenceManager:
+    def __init__(self, model_path, device="cuda" if torch.cuda.is_available() else "cpu"):
+        self.device = device
+        self.model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         
-        # Format the prompt
-        formatted_prompt = format_chat_prompt(prompt, system_prompt)
-        
-        # Tokenize the prompt
-        inputs = tokenizer(formatted_prompt, return_tensors="pt")
-        
-        # Generate response
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs.input_ids,
+    def generate_response(self, prompt, history=None, max_length=4096, temperature=0.7,
+                         top_p=0.95, top_k=50, repetition_penalty=1.1, min_length=20,
+                         max_new_tokens=1024):
+        try:
+            # Prepare input
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            
+            # Generate response
+            outputs = self.model.generate(
+                **inputs,
                 max_length=max_length,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.95,
-                top_k=50,
-                repetition_penalty=1.1,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                num_return_sequences=1,
-                max_time=30.0,
-                no_repeat_ngram_size=3
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                min_length=min_length,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=self.tokenizer.eos_token_id,
+                do_sample=True
             )
-        
-        # Decode and clean up the response
-        response = tokenizer.decode(outputs[0], skip_special_tokens=False)
-        response = clean_response(response)
-        
-        return response
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
+            
+            # Decode response
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Remove prompt from response
+            response = response[len(prompt):].strip()
+            
+            # Check if response is too short
+            if len(response) < 10 and len(prompt) > 20:
+                logger.warning("Generated response too short, retrying with adjusted parameters")
+                return self.generate_response(
+                    prompt,
+                    history,
+                    max_length=max_length,
+                    temperature=temperature * 1.2,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty * 1.1,
+                    min_length=min_length,
+                    max_new_tokens=max_new_tokens * 2
+                )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}")
+            return "I apologize, but I encountered an error generating a response. Please try again."
+            
+    def __call__(self, prompt, history=None):
+        return self.generate_response(prompt, history)
 
 def main():
     """Main function to run the model."""
@@ -137,7 +182,7 @@ def main():
             if user_input.lower() == 'quit':
                 break
                 
-            response = generate_response(model, tokenizer, user_input)
+            response = InferenceManager(model, "cuda" if torch.cuda.is_available() else "cpu")(user_input)
             print(f"Assistant: {response}\n")
             
     except Exception as e:

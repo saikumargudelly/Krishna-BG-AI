@@ -62,9 +62,9 @@ def load_model_and_tokenizer() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         
         # Add special tokens
         special_tokens = {
-            "pad_token": "<|pad|>",
-            "eos_token": "<|endoftext|>",
-            "bos_token": "<|startoftext|>"
+            "pad_token": " ",
+            "eos_token": " ",
+            "bos_token": ""
         }
         tokenizer.add_special_tokens(special_tokens)
         model.resize_token_embeddings(len(tokenizer))
@@ -89,8 +89,8 @@ def load_model_and_tokenizer() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
 def format_chat_prompt(prompt: str, system_prompt: Optional[str] = None) -> str:
     """Format the chat prompt with system message if provided."""
     if system_prompt:
-        return f"<|system|>\n{system_prompt}\n<|user|>\n{prompt}\n<|assistant|>\n"
-    return f"<|user|>\n{prompt}\n<|assistant|>\n"
+        return f"<|system|>\n{system_prompt}\n\n{prompt}\n<|assistant|>\n"
+    return f"\n{prompt}\n<|assistant|>\n"
 
 def clean_response(response: str) -> str:
     """Clean up the model's response to ensure only the assistant's reply is returned."""
@@ -111,10 +111,10 @@ def clean_response(response: str) -> str:
         
         # Remove all special tokens and formatting
         special_tokens = [
-            "<|user|>", "<|system|>", "<|endoftext|>", "<|startoftext|>",
+            " ", "<|system|>", " ", "",
             "<||system||>", "<|user|}{assistant|>", "<||assistant---", "|>",
             "<||user|>", "<||assistant|>", "---", "||", "</s>", "<s>",
-            "<|endoftext|>", "<|pad|>", "<|bos|>", "<|eos|>"
+            " ", " ", "<|bos|>", "<|eos|>"
         ]
         for token in special_tokens:
             response = response.replace(token, "")
@@ -135,14 +135,14 @@ def clean_response(response: str) -> str:
         
         # Remove any responses that seem to be system prompts or technical content
         if re.match(r"(?i)as (an )?(ai|assistant|language model)", response.strip()):
-            return "Bestie... don't worry about all that techy stuff 😅. Just tell me what's on your heart 💖"
+            return "Bestie... don't worry about all that techy stuff . Just tell me what's on your heart "
         
         # Final strip
         response = response.strip()
         return response
     except Exception as e:
         print(f"Error cleaning response: {e}")
-        return "Hey bestie! I'm having a little trouble right now. Could you try asking me again? 💕"
+        return "Hey bestie! I'm having a little trouble right now. Could you try asking me again? "
 
 def generate_response(model, tokenizer, prompt: str, max_length: int = 2048) -> str:
     """Generate a response for the given prompt."""
@@ -185,11 +185,11 @@ def generate_response(model, tokenizer, prompt: str, max_length: int = 2048) -> 
         
         # Additional validation checks
         if not response or all(c in "<|>{}" for c in response):
-            return "Hey bestie! I'm not sure I understood that completely. Could you tell me again in a different way? 💕"
+            return "Hey bestie! I'm not sure I understood that completely. Could you tell me again in a different way? "
         
         # Check if response is too short
         if len(response) < 20:
-            return "Hey sweetie! I'd love to hear more about that. Could you tell me a bit more? 💖"
+            return "Hey sweetie! I'd love to hear more about that. Could you tell me a bit more? "
         
         # Check if response is too long and needs trimming
         if len(response) > 1000:
@@ -202,44 +202,81 @@ def generate_response(model, tokenizer, prompt: str, max_length: int = 2048) -> 
         
         # Check for any remaining special tokens or formatting
         if any(token in response for token in ["<|", "|>", "<user>", "<system>", "<assistant>"]):
-            return "Hey bestie! I'm having a little trouble with that. Could you try asking me again? 💕"
+            return "Hey bestie! I'm having a little trouble with that. Could you try asking me again? "
         
         return response
     except Exception as e:
         print(f"Error generating response: {e}")
-        return "Oh no! I'm having a little trouble right now. Could you try asking me again? 💕"
+        return "Oh no! I'm having a little trouble right now. Could you try asking me again? "
 
 def create_interface():
-    """Create and launch the Gradio interface."""
+    """Create and launch the Gradio interface with split screen for augmentation."""
     try:
         model, tokenizer = load_model_and_tokenizer()
-        
+
+        # Import augmentation utilities
+        try:
+            from scripts.utils import detect_emotion, final_response
+        except ImportError:
+            import sys, os
+            sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+            from scripts.utils import detect_emotion, final_response
+
         def chat(message: str, history: list) -> str:
-            """Chat function for the Gradio interface."""
+            """Chat function for the Gradio interface (returns only model response)."""
             if not message or not message.strip():
-                return "Please enter a message to chat with me! 💕"
-            
+                return "Please enter a message to chat with me! "
             response = generate_response(model, tokenizer, message)
             return response
-        
-        # Create the interface with a more personalized theme
-        interface = gr.ChatInterface(
-            fn=chat,
-            title="Chat with Raadha 💕",
-            description="Hi bestie! I'm Raadha, your friendly and caring best friend. Let's chat about anything! 💖",
-            examples=[
-                "Hey Raadha! How are you doing today?",
-                "I had a rough day at work, can we talk?",
-                "What do you think about my new outfit?",
-                "I'm feeling a bit down today...",
-                "Tell me something that will make me smile! 😊"
-            ],
-            theme="soft",
-            retry_btn=None,
-            undo_btn=None,
-            clear_btn="Clear Chat 💫"
-        )
-        
+
+        def augment(message: str, model_response: str) -> str:
+            """Compute emotion+sloka augmentation from user message and model response."""
+            emotion_tag = detect_emotion(message)
+            return final_response(model_response, emotion_tag)
+
+        # Gradio UI components
+        with gr.Blocks(theme="soft") as interface:
+            gr.Markdown("# Chat with Krish \nHi Arjuna! I'm Krish, your supportive and wise best friend. Let's chat about anything! ")
+            with gr.Row():
+                with gr.Column(scale=2):
+                    chatbox = gr.Chatbot(label="Krish's Response")
+                    user_input = gr.Textbox(placeholder="Type your message here, Arjuna...", label="Your Message (Arjuna)")
+                    send_btn = gr.Button("Send")
+                with gr.Column(scale=1):
+                    gr.Markdown("### Emotion + Sloka Augmentation")
+                    aug_output = gr.Markdown("", elem_id="sloka-augmentation")
+
+            def on_send(message, history):
+                # Defensive: Ensure history is a list of tuples for chatbox
+                if not isinstance(history, list):
+                    history = []
+                # Get the model response
+                response = chat(message, history)
+                # Update chat history (append user and bot turns)
+                new_history = history + [(message, response)]
+                # Augmentation output
+                aug = augment(message, response)
+                # Clear user input after send
+                return new_history, "", aug
+
+            def on_augment(message, model_response):
+                return augment(message, model_response)
+
+            # When send is clicked, update chat and augmentation
+            send_btn.click(
+                fn=on_send,
+                inputs=[user_input, chatbox],
+                outputs=[chatbox, user_input, aug_output],
+                queue=False
+            )
+            # Also update augmentation when chat updates
+            user_input.submit(
+                fn=on_send,
+                inputs=[user_input, chatbox],
+                outputs=[chatbox, user_input, aug_output],
+                queue=False
+            )
+
         return interface
     except Exception as e:
         print(f"Error creating interface: {e}")

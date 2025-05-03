@@ -94,10 +94,14 @@ async def chat(request: ChatRequest):
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_length=request.max_length,
+                max_new_tokens=120,
+                #max_length=request.max_length,
                 num_return_sequences=1,
-                temperature=request.temperature,
-                top_p=request.top_p,
+                temperature=request.temperature or 0.85,
+                top_p=request.top_p or 0.95,
+                top_k=50,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=3,
                 do_sample=True,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id
