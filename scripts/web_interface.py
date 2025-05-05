@@ -1,3 +1,11 @@
+import sys
+import os
+import logging
+from functools import lru_cache
+from typing import Optional, Tuple, Dict, Any, List, TYPE_CHECKING
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
@@ -5,307 +13,332 @@ import yaml
 import json
 import gradio as gr
 import re
-import os
-import sys
-from typing import Optional, Tuple
+from sentence_transformers import SentenceTransformer, util
 
-def load_config(config_path: str = "config/train_config.yaml") -> dict:
-    """Load training configuration."""
-    try:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-        return config
-    except Exception as e:
-        print(f"Error loading config: {e}")
-        sys.exit(1)
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_system_prompt(config_path: str = "config/system_prompt.yaml") -> str:
-    """Load system prompt from config."""
-    try:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-        return config.get("system_prompt", "")
-    except Exception as e:
-        print(f"Error loading system prompt: {e}")
-        return ""
+# Type checking imports
+if TYPE_CHECKING:
+    from scripts.rag_manager import RAGManager
 
-def load_lora_config(config_path: str = "config/lora_config.json") -> dict:
-    """Load LoRA configuration."""
-    try:
-        with open(config_path, "r") as f:
-            config = json.load(f)
-        return config
-    except Exception as e:
-        print(f"Error loading LoRA config: {e}")
-        return {}
+# RAG Integration
+try:
+    from scripts.rag_manager import RAGManager
+    rag_enabled = True
+    rag_manager = RAGManager()
+except ImportError as e:
+    logging.warning(f"RAG integration failed: {e}")
+    rag_enabled = False
+    rag_manager = None
+except Exception as e:
+    logging.error(f"Unexpected error during RAG initialization: {e}")
+    rag_enabled = False
+    rag_manager = None
 
-def load_model_and_tokenizer() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Load the base model, tokenizer, and LoRA weights."""
-    try:
-        config = load_config()
-        lora_config = load_lora_config()
-        
-        # Load base model
-        model = AutoModelForCausalLM.from_pretrained(
-            config["model"]["base_model"],
-            torch_dtype=torch.float32,
-            device_map="cpu",
-            low_cpu_mem_usage=True
-        )
-        
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(
-            config["model"]["base_model"],
-            padding_side="right",
-            use_fast=True
-        )
-        
-        # Add special tokens
-        special_tokens = {
-            "pad_token": " ",
-            "eos_token": " ",
-            "bos_token": ""
-        }
-        tokenizer.add_special_tokens(special_tokens)
-        model.resize_token_embeddings(len(tokenizer))
-        
-        # Try to load LoRA weights with error handling
+# --- Device selection ---
+device = (
+    "mps" if torch.backends.mps.is_available() else
+    "cuda" if torch.cuda.is_available() else
+    "cpu"
+)
+
+# --- Sloka augmentation stubs (replace with your real logic if needed) ---
+def detect_emotion(message: str) -> str:
+    # Dummy: always returns 'neutral'
+    return "neutral"
+
+def get_relevant_sloka(emotion: str) -> dict:
+    # Dummy: always returns a sample sloka
+    return {
+        'chapter': '2',
+        'verse': '47',
+        'sloka': 'Karmanye vadhikaraste ma phaleshu kadachana',
+        'meaning': 'You have the right to work, but never to the fruit of work.'
+    }
+
+def final_response(message: str, model_response: str) -> str:
+    # Dummy: just returns the model response
+    return model_response
+
+class ModelManager:
+    _instance = None
+    _initialized = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(ModelManager, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if not self._initialized:
+            self.model = None
+            self.tokenizer = None
+            self.encoder = None
+            self.config = None
+            self.lora_config = None
+            self.system_prompt = None
+            self._initialized = True
+
+    def load_configs(self):
         try:
-            model = PeftModel.from_pretrained(
-                model, 
-                config["output"]["output_dir"],
-                is_trainable=False  # Set to False for inference
-            )
-            print("Successfully loaded LoRA weights")
+            with open("config/train_config.yaml", "r") as f:
+                self.config = yaml.safe_load(f)
+            with open("config/lora_config.json", "r") as f:
+                self.lora_config = json.load(f)
+            with open("config/system_prompt.yaml", "r") as f:
+                self.system_prompt = yaml.safe_load(f).get("system_prompt", "")
         except Exception as e:
-            print(f"Warning: Could not load LoRA weights: {e}")
-            print("Continuing with base model only")
+            logging.error(f"Failed to load configurations: {e}")
+            raise
+
+    def initialize_model(self):
+        if self.model is not None:
+            return
+
+        if not self.config:
+            self.load_configs()
+
+        logging.info(f"Loading base model: {self.config['model']['base_model']}")
         
-        return model, tokenizer
-    except Exception as e:
-        print(f"Error loading model and tokenizer: {e}")
-        sys.exit(1)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config["model"]["base_model"],
+                torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+                device_map=device,
+                low_cpu_mem_usage=True
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config["model"]["base_model"],
+                padding_side="right",
+                use_fast=True
+            )
+            self.tokenizer.add_special_tokens({"pad_token": "[PAD]", "eos_token": "</s>", "bos_token": "<s>"})
+            self.model.resize_token_embeddings(len(self.tokenizer))
+
+            try:
+                lora_path = self.config["output"]["output_dir"]
+                logging.info(f"Loading LoRA adapter from: {lora_path}")
+                self.model = PeftModel.from_pretrained(self.model, lora_path, is_trainable=False)
+                logging.info("Successfully loaded LoRA weights.")
+            except Exception as e:
+                logging.error(f"Warning: Could not load LoRA weights: {e}")
+                logging.info("Continuing with base model only.")
+
+            self.model.eval()
+            self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+            self.model.to(device)
+        except Exception as e:
+            logging.error(f"Failed to initialize model: {e}")
+            raise
+
+# Initialize model manager
+model_manager = ModelManager()
+
+@lru_cache(maxsize=100)
+def semantic_relevance(response: str, user_query: str, threshold: float = 0.4) -> bool:
+    try:
+        if not model_manager.encoder:
+            model_manager.initialize_model()
+        emb_query = model_manager.encoder.encode(user_query, convert_to_tensor=True)
+        emb_resp = model_manager.encoder.encode(response, convert_to_tensor=True)
+        sim = float(util.pytorch_cos_sim(emb_query, emb_resp))
+        return sim >= threshold
+    except Exception:
+        return False
 
 def format_chat_prompt(prompt: str, system_prompt: Optional[str] = None) -> str:
-    """Format the chat prompt with system message if provided."""
     if system_prompt:
-        return f"<|system|>\n{system_prompt}\n\n{prompt}\n<|assistant|>\n"
-    return f"\n{prompt}\n<|assistant|>\n"
+        return f"{system_prompt}\nUser: {prompt}\nAssistant:"
+    return f"User: {prompt}\nAssistant:"
+
+def build_prompt(messages: List[Dict[str, str]], system_prompt: str = None, max_turns: int = 3) -> str:
+    """Build a prompt from conversation history."""
+    prompt = []
+    
+    # Add system prompt first if provided
+    if system_prompt:
+        prompt.append(f"<|system|>\n{system_prompt}\n")
+    
+    # Only keep the last max_turns*2 messages
+    messages = messages[-max_turns*2:]
+    
+    # Add conversation history
+    for msg in messages:
+        role = msg.get("role", "").lower()
+        content = msg.get("content", "").strip()
+        if role == "user" and content:
+            prompt.append(f"<|user|>\n{content}")
+        elif role == "assistant" and content:
+            prompt.append(f"<|assistant|>\n{content}")
+    
+    # Always end with assistant cue for generation
+    prompt.append("<|assistant|>\n")
+    
+    return "\n".join(prompt)
 
 def clean_response(response: str) -> str:
-    """Clean up the model's response to ensure only the assistant's reply is returned."""
-    try:
-        # Always extract only the assistant's reply
-        if "<|assistant|>" in response:
-            response = response.split("<|assistant|>")[-1]
-        
-        # Remove everything after a user prompt token (hard stop)
-        user_prompt_patterns = [
-            r"<\|user\|>", r"<user>", r"<USER>", r"<\\?\\?user\\?\\?>",
-            r"User:", r"user:", r"</s>", r"<\|user\|"
-        ]
-        for pattern in user_prompt_patterns:
-            match = re.search(pattern, response)
-            if match:
-                response = response[:match.start()]
-        
-        # Remove all special tokens and formatting
-        special_tokens = [
-            " ", "<|system|>", " ", "",
-            "<||system||>", "<|user|}{assistant|>", "<||assistant---", "|>",
-            "<||user|>", "<||assistant|>", "---", "||", "</s>", "<s>",
-            " ", " ", "<|bos|>", "<|eos|>"
-        ]
-        for token in special_tokens:
-            response = response.replace(token, "")
-        
-        # Remove any remaining angle-bracketed tokens
-        response = re.sub(r"<\\|.*?\\|>", "", response)
-        response = re.sub(r"<.*?>", "", response)
-        
-        # Remove URLs and technical content - but be less aggressive
-        if "http://" in response and not response.endswith("http://"):
-            response = response.split("http://")[0].strip()
-        if "https://" in response and not response.endswith("https://"):
-            response = response.split("https://")[0].strip()
-        
-        # Remove any remaining technical artifacts
-        response = re.sub(r"\s+", " ", response)  # Normalize whitespace
-        response = re.sub(r"\.{3,}", "...", response)  # Normalize ellipsis
-        
-        # Remove any responses that seem to be system prompts or technical content
-        if re.match(r"(?i)as (an )?(ai|assistant|language model)", response.strip()):
-            return "Bestie... don't worry about all that techy stuff . Just tell me what's on your heart "
-        
-        # Final strip
-        response = response.strip()
-        return response
-    except Exception as e:
-        print(f"Error cleaning response: {e}")
-        return "Hey bestie! I'm having a little trouble right now. Could you try asking me again? "
+    # First remove any system prompt echoes
+    system_patterns = [
+        r"You are Krishna.*?CRITICAL INSTRUCTIONS:.*?(?:\d+\.)+",
+        r"<\|system\|>.*?CRITICAL INSTRUCTIONS:.*?(?:\d+\.)+",
+        r"You are.*?CRITICAL INSTRUCTIONS:.*?(?:\d+\.)+"
+    ]
+    for pattern in system_patterns:
+        response = re.sub(pattern, '', response, flags=re.DOTALL)
+    
+    # Stop at any special tag
+    stop_tokens = ["<|user|>", "<|system|>", "<|assistant|>"]
+    for token in stop_tokens:
+        if token in response:
+            response = response.split(token)[0]
+    
+    # Remove excessive whitespace
+    response = response.strip()
+    
+    # Only keep the first 2-3 sentences
+    sentences = re.split(r'(?<=[.!?]) +', response)
+    response = " ".join(sentences[:3])
+    
+    # Validate response
+    if not response or len(response.strip()) < 5:
+        return "Hey bestie! I'd love to hear more about that. Could you tell me a bit more?"
+    
+    # Check for remaining system prompt fragments
+    if any(pattern in response.lower() for pattern in ["you are", "critical instructions", "system prompt"]):
+        return "Hey sweetie! I'm having a little trouble with that. Could you try asking me again?"
+    
+    return response
 
-def generate_response(model, tokenizer, prompt: str, max_length: int = 2048) -> str:
-    """Generate a response for the given prompt."""
+def generate_response(
+    message: str,
+    history: List[Tuple[str, str]],
+    system_prompt: str = None,
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 40,
+    repetition_penalty: float = 1.1,
+    rag_manager: Optional["RAGManager"] = None
+) -> str:
+    """Generate a response using the model with RAG enhancement."""
     try:
-        # Load system prompt
-        system_prompt = load_system_prompt()
-        
-        # Format the prompt
-        formatted_prompt = format_chat_prompt(prompt, system_prompt)
-        
-        # Tokenize the prompt
-        inputs = tokenizer(formatted_prompt, return_tensors="pt")
-        
-        # Generate response with optimized parameters for better quality and length
+        messages = []
+        for user_msg, assistant_msg in history:
+            if user_msg.strip():
+                messages.append({"role": "user", "content": user_msg})
+            if assistant_msg.strip():
+                messages.append({"role": "assistant", "content": assistant_msg})
+        if message.strip():
+            messages.append({"role": "user", "content": message})
+        if rag_manager:
+            relevant_response = rag_manager.get_relevant_response(message, messages)
+            if relevant_response:
+                return relevant_response
+        prompt = build_prompt(messages, system_prompt)
+        if rag_manager:
+            enhanced_messages = rag_manager.enhance_prompt(message, messages)
+            prompt = build_prompt(enhanced_messages, system_prompt)
+        inputs = model_manager.tokenizer(prompt, return_tensors="pt", padding=True)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
         with torch.no_grad():
-            outputs = model.generate(
-                inputs.input_ids,
-                max_length=min(max_length, 2048),  # Increased for longer responses
-                temperature=0.85,  # Slightly increased for more creative responses
-                do_sample=True,
-                top_p=0.95,  # Increased for more diverse responses
-                top_k=100,   # Increased for better quality
-                repetition_penalty=1.2,  # Increased to avoid repetition
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                num_return_sequences=1,
-                max_time=15.0,  # Increased for better quality
-                no_repeat_ngram_size=4,  # Increased to avoid repetition
-                min_length=50,  # Increased minimum length
-                max_new_tokens=1024,  # Increased for longer responses
-                length_penalty=1.5,  # Increased to encourage longer responses
-                early_stopping=True,
-                use_cache=True,
-                num_beams=1
+            outputs = model_manager.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                pad_token_id=model_manager.tokenizer.eos_token_id,
+                do_sample=True
             )
-        
-        # Decode and clean up the response
-        response = tokenizer.decode(outputs[0], skip_special_tokens=False)
-        response = clean_response(response)
-        
-        # Additional validation checks
-        if not response or all(c in "<|>{}" for c in response):
-            return "Hey bestie! I'm not sure I understood that completely. Could you tell me again in a different way? "
-        
-        # Check if response is too short
-        if len(response) < 20:
-            return "Hey sweetie! I'd love to hear more about that. Could you tell me a bit more? "
-        
-        # Check if response is too long and needs trimming
-        if len(response) > 1000:
-            # Find a good stopping point near 1000 characters
-            last_period = response[:1000].rfind('.')
-            if last_period > 800:  # Only trim if we can find a good stopping point
-                response = response[:last_period + 1]
-            else:
-                response = response[:1000] + "..."
-        
-        # Check for any remaining special tokens or formatting
-        if any(token in response for token in ["<|", "|>", "<user>", "<system>", "<assistant>"]):
-            return "Hey bestie! I'm having a little trouble with that. Could you try asking me again? "
-        
-        return response
+        response = model_manager.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+        cleaned_response = clean_response(response)
+        return cleaned_response
     except Exception as e:
-        print(f"Error generating response: {e}")
-        return "Oh no! I'm having a little trouble right now. Could you try asking me again? "
+        logging.error(f"Error generating response: {str(e)}")
+        return "I apologize, but I encountered an error while generating a response. Please try again."
 
-def create_interface():
-    """Create and launch the Gradio interface with split screen for augmentation."""
+def format_chatml(messages: List[Dict[str, str]], system_prompt: str = None) -> str:
+    formatted = []
+    if system_prompt:
+        formatted.append(f"<|system|>\n{system_prompt}")
+    for msg in messages:
+        role = msg.get("role", "").lower()
+        content = msg.get("content", "").strip()
+        if role == "user":
+            formatted.append(f"<|user|>\n{content}")
+        elif role == "assistant":
+            formatted.append(f"<|assistant|>\n{content}")
+    # Always end with assistant cue for generation
+    formatted.append("<|assistant|>\n")
+    return "\n".join(formatted)
+
+def chat(message: str, history: List[Tuple[str, str]], system_prompt: str = None) -> Tuple[str, str]:
+    """Handle chat interaction with RAG enhancement."""
     try:
-        model, tokenizer = load_model_and_tokenizer()
-
-        # Import augmentation utilities
-        try:
-            from scripts.utils import detect_emotion, final_response
-        except ImportError:
-            import sys, os
-            sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-            from scripts.utils import detect_emotion, final_response
-
-        def chat(message: str, history: list) -> str:
-            """Chat function for the Gradio interface (returns only model response)."""
-            if not message or not message.strip():
-                return "Please enter a message to chat with me! "
-            response = generate_response(model, tokenizer, message)
-            return response
-
-        def augment(message: str, model_response: str) -> str:
-            """Compute emotion+sloka augmentation from user message and model response."""
-            emotion_tag = detect_emotion(message)
-            return final_response(model_response, emotion_tag)
-
-        # Gradio UI components
-        with gr.Blocks(theme="soft") as interface:
-            gr.Markdown("# Chat with Krish \nHi Arjuna! I'm Krish, your supportive and wise best friend. Let's chat about anything! ")
-            with gr.Row():
-                with gr.Column(scale=2):
-                    chatbox = gr.Chatbot(label="Krish's Response")
-                    user_input = gr.Textbox(placeholder="Type your message here, Arjuna...", label="Your Message (Arjuna)")
-                    send_btn = gr.Button("Send")
-                with gr.Column(scale=1):
-                    gr.Markdown("### Emotion + Sloka Augmentation")
-                    aug_output = gr.Markdown("", elem_id="sloka-augmentation")
-
-            def on_send(message, history):
-                # Defensive: Ensure history is a list of tuples for chatbox
-                if not isinstance(history, list):
-                    history = []
-                # Get the model response
-                response = chat(message, history)
-                # Update chat history (append user and bot turns)
-                new_history = history + [(message, response)]
-                # Augmentation output
-                aug = augment(message, response)
-                # Clear user input after send
-                return new_history, "", aug
-
-            def on_augment(message, model_response):
-                return augment(message, model_response)
-
-            # When send is clicked, update chat and augmentation
-            send_btn.click(
-                fn=on_send,
-                inputs=[user_input, chatbox],
-                outputs=[chatbox, user_input, aug_output],
-                queue=False
-            )
-            # Also update augmentation when chat updates
-            user_input.submit(
-                fn=on_send,
-                inputs=[user_input, chatbox],
-                outputs=[chatbox, user_input, aug_output],
-                queue=False
-            )
-
-        return interface
+        response = generate_response(
+            message=message,
+            history=history,
+            system_prompt=system_prompt,
+            rag_manager=rag_manager
+        )
+        # Sloka augmentation
+        emotion_tag = detect_emotion(message)
+        sloka = get_relevant_sloka(emotion_tag)
+        if sloka:
+            meaning = sloka.get('meaning', '')
+            if len(meaning) > 300:
+                meaning = meaning[:300] + '...'
+            sloka_text = f"Sloka {sloka.get('chapter', '?')}.{sloka.get('verse', '?')}\n{sloka.get('sloka', '')}\nMeaning: {meaning}"
+        else:
+            sloka_text = "(No relevant sloka found for your emotion, but I'm here for you!)"
+        return response, sloka_text
     except Exception as e:
-        print(f"Error creating interface: {e}")
-        sys.exit(1)
+        logging.error(f"Error in chat: {str(e)}")
+        return "I apologize, but I encountered an error. Please try again.", "(No sloka available)"
+
+# --- Custom Gradio Blocks UI ---
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# KRISH AI Chat\nChat with KRISH AI - Your friendly and helpful assistant!")
+    with gr.Row():
+        with gr.Column(scale=2):
+            chatbot = gr.Chatbot(label="Krish's Response")
+            user_input = gr.Textbox(placeholder="Type your message here...", label="Your Message")
+            send_btn = gr.Button("Submit")
+        with gr.Column(scale=1):
+            gr.Markdown("### Emotion + Sloka Augmentation")
+            sloka_output = gr.Markdown("", elem_id="sloka-augmentation")
+    def on_send(message, history):
+        if not isinstance(history, list):
+            history = []
+        response, sloka = chat(message, history)
+        new_history = history + [(message, response)]
+        return new_history, "", sloka
+    send_btn.click(fn=on_send, inputs=[user_input, chatbot], outputs=[chatbot, user_input, sloka_output], queue=False)
+    user_input.submit(fn=on_send, inputs=[user_input, chatbot], outputs=[chatbot, user_input, sloka_output], queue=False)
+
+def find_available_port(start_port: int = 3000, end_port: int = 3010) -> int:
+    import socket
+    for port in range(start_port, end_port + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return port
+        except OSError:
+            continue
+    raise OSError("No available ports found in the specified range")
 
 if __name__ == "__main__":
     try:
-        interface = create_interface()
+        # Initialize model manager first
+        model_manager.load_configs()
+        model_manager.initialize_model()
         
-        # Try multiple ports
-        ports = range(3000, 3010)  # Try ports 3000-3009
-        for port in ports:
-            try:
-                interface.launch(
-                    server_name="127.0.0.1",
-                    server_port=port,
-                    share=True,
-                    show_error=True
-                )
-                break  # If successful, break the loop
-            except OSError as e:
-                if port == ports[-1]:  # If this was the last port to try
-                    print(f"Error: Could not find an available port in range {ports[0]}-{ports[-1]}")
-                    print("Please try one of these solutions:")
-                    print("1. Close other applications using these ports")
-                    print("2. Set a different port using the GRADIO_SERVER_PORT environment variable")
-                    print("3. Specify a different port in the launch() parameters")
-                    sys.exit(1)
-                continue  # Try next port
+        # Launch the interface
+        demo.launch(share=True)
     except Exception as e:
-        print(f"Fatal error: {e}")
-        sys.exit(1) 
+        logging.error(f"Failed to start interface: {e}")
+        sys.exit(1)

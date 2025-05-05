@@ -36,7 +36,7 @@ training:
 
 # Data Configuration
 data:
-  train_file: "data/train.json"
+  train_file: "data/train1.cleaned.json"
   eval_file: "data/eval.json"
   max_samples: 1000
 
@@ -51,4 +51,4 @@ hardware:
   bf16: false
   gradient_checkpointing: true
   optim: "adamw_torch"
-  use_cpu: true 
+  use_cpu: true

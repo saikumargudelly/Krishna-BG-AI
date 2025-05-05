@@ -73,9 +73,9 @@ def prepare_model_and_tokenizer(config, checkpoint_path=None):
     
     # Add special tokens
     special_tokens = {
-        "pad_token": "<|pad|>",
-        "eos_token": "<|endoftext|>",
-        "bos_token": "<|startoftext|>"
+        "pad_token": " ",
+        "eos_token": "",
+        "bos_token": ""
     }
     tokenizer.add_special_tokens(special_tokens)
     model.resize_token_embeddings(len(tokenizer))
@@ -85,11 +85,9 @@ def prepare_model_and_tokenizer(config, checkpoint_path=None):
 def prepare_lora_model(model, lora_config: dict, checkpoint_path=None):
     """Prepare model for LoRA fine-tuning."""
     print("Preparing model for LoRA training...")
-    
-    # Prepare model for training
+
+    # Always initialize LoRA on the base model (do not attempt to load from Trainer checkpoint)
     model = prepare_model_for_kbit_training(model)
-    
-    # Create LoRA configuration with memory optimizations
     peft_config = LoraConfig(
         r=lora_config["r"],
         lora_alpha=lora_config["lora_alpha"],
@@ -100,24 +98,12 @@ def prepare_lora_model(model, lora_config: dict, checkpoint_path=None):
         inference_mode=False,
         modules_to_save=lora_config["modules_to_save"]
     )
-    
-    # Apply LoRA
     model = get_peft_model(model, peft_config)
-    
-    # Load from checkpoint if available
-    if checkpoint_path:
-        print(f"Loading model from checkpoint: {checkpoint_path}")
-        model = PeftModel.from_pretrained(model, checkpoint_path)
-    
+
     model.train()
-    
-    # Enable gradient computation
     for param in model.parameters():
         param.requires_grad = True
-    
-    # Print trainable parameters info
     model.print_trainable_parameters()
-    
     return model
 
 def format_chatml(example: dict) -> dict:
@@ -128,7 +114,7 @@ def format_chatml(example: dict) -> dict:
         role = msg["role"]
         content = msg["content"]
         formatted_text += f"<|{role}|>\n{content}\n"
-    formatted_text += "<|endoftext|>"
+    formatted_text += " "
     return {"text": formatted_text}
 
 def prepare_datasets(config: dict, tokenizer):
@@ -239,6 +225,26 @@ def setup_training_args(config: dict, resume_from_checkpoint=None) -> TrainingAr
         resume_from_checkpoint=resume_from_checkpoint
     )
 
+def get_latest_checkpoint(output_dir):
+    """Helper function to find the latest checkpoint in the output directory."""
+    checkpoints = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))]
+    if not checkpoints:
+        return None
+    checkpoints = sorted(checkpoints, key=lambda x: int(x.split('-')[-1]))
+    return os.path.join(output_dir, checkpoints[-1])
+
+def is_valid_checkpoint(checkpoint_path):
+    """
+    Checks if the checkpoint directory contains essential files for resuming training.
+    """
+    if not checkpoint_path or not os.path.isdir(checkpoint_path):
+        return False
+    required_files = ["pytorch_model.bin", "trainer_state.json"]
+    for fname in required_files:
+        if not os.path.isfile(os.path.join(checkpoint_path, fname)):
+            return False
+    return True
+
 def main():
     """Main training function."""
     try:
@@ -246,27 +252,20 @@ def main():
         config = load_config()
         lora_config = load_lora_config()
         
-        # Check for existing checkpoints
-        output_dir = config["output"]["output_dir"]
-        latest_checkpoint = find_latest_checkpoint(output_dir)
-        
         # Initialize wandb
         run_name = f"lora-finetune-{config['model']['base_model'].split('/')[-1]}"
-        if latest_checkpoint:
-            run_name += f"-resumed-{latest_checkpoint.split('-')[-1]}"
-        
         wandb.init(
             project="raadhe-ai",
             config=config,
             name=run_name,
-            resume="allow" if latest_checkpoint else None
+            resume="allow"
         )
         
         # Prepare model and tokenizer
         model, tokenizer = prepare_model_and_tokenizer(config)
         
         # Prepare LoRA model, loading from checkpoint if available
-        model = prepare_lora_model(model, lora_config, latest_checkpoint)
+        model = prepare_lora_model(model, lora_config)
         
         # Move model to CPU
         device = torch.device("cpu")
@@ -276,7 +275,9 @@ def main():
         # Prepare datasets
         tokenized_dataset = prepare_datasets(config, tokenizer)
         
-        # Setup training arguments with checkpoint resumption
+        # Setup training arguments
+        output_dir = config["output"]["output_dir"]
+        latest_checkpoint = get_latest_checkpoint(output_dir)
         training_args = setup_training_args(config, latest_checkpoint)
         
         # Create data collator
@@ -295,9 +296,16 @@ def main():
             data_collator=data_collator
         )
         
-        # Train model
-        print("Starting training...")
-        trainer.train(resume_from_checkpoint=latest_checkpoint)
+        # Only resume if checkpoint is valid
+        if is_valid_checkpoint(latest_checkpoint):
+            print(f"Resuming from checkpoint: {latest_checkpoint}")
+            trainer.train(resume_from_checkpoint=latest_checkpoint)
+        else:
+            if latest_checkpoint:
+                print(f"Checkpoint {latest_checkpoint} is invalid or incomplete. Starting training from scratch.")
+            else:
+                print("No valid checkpoint found, starting from scratch.")
+            trainer.train()
         
         # Save final model
         print("Saving model...")
@@ -312,4 +320,4 @@ def main():
         raise e
 
 if __name__ == "__main__":
-    main() 
+    main()

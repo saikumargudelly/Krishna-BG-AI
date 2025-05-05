@@ -1,9 +1,12 @@
+import sys
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import yaml
 import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel, PeftConfig
+from scripts.utils import format_chatml
 
 def load_config():
     with open("config/train_config.yaml", "r") as f:
@@ -32,122 +35,126 @@ def load_model_and_tokenizer(config):
     
     return model, tokenizer
 
-def format_prompt(messages):
-    formatted_text = ""
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        formatted_text += f"<|{role}|>\n{content}\n"
-    return formatted_text
+# --- RAG Integration for Contextual Responses ---
+try:
+    from scripts.rag_manager import RAGManager
+    rag_enabled = True
+    rag_manager = RAGManager()
+except Exception as e:
+    rag_enabled = False
+    rag_manager = None
+
+def ensure_human_touch(response):
+    # Add a friendly emoji if none present
+    if not any(char in response for char in '😊💛💜💕😃😄🙂😌🤗🥰'): 
+        response += " 😊"
+    # If too short or generic, add a friendly phrase
+    if len(response.strip()) < 20:
+        response += " Let me know more, bestie! 💛"
+    return response
+
+def is_spiritual_or_emotion_query(query):
+    # Check for keywords related to spirituality, emotion, or sloka
+    keywords = [
+        'spiritual', 'spirituality', 'sloka', 'shloka', 'bhagavad', 'gita', 'emotion', 'emotional', 'feeling', 'feelings', 'mood', 'mantra', 'meditation', 'mindfulness', 'karma', 'yoga', 'peace', 'happiness', 'sad', 'joy', 'anger', 'fear', 'love', 'compassion', 'mental', 'well-being', 'wellbeing', 'stress', 'anxiety', 'depression', 'mind', 'soul', 'atma', 'atman', 'spirit', 'divine', 'consciousness'
+    ]
+    q = query.lower()
+    return any(kw in q for kw in keywords)
+
+
+def build_aggressive_prompt(user_query, rag_contexts, persona_msg, direct_answer_mode=True):
+    prompt_parts = []
+    # Persona always first, add direct answer instruction
+    if direct_answer_mode:
+        persona = persona_msg['content'] + " Always answer the user's question directly and concisely. Only add a sloka or emotion if the question is about spirituality, emotion, or slokas."
+    else:
+        persona = persona_msg['content']
+    prompt_parts.append(f"<|system|>\n{persona}\n")
+    # Explicit RAG context block (only if relevant and available)
+    if rag_contexts:
+        prompt_parts.append("<|system|>\nHere are some previous conversations that may help answer the user's question:\n")
+        for idx, ctx in enumerate(rag_contexts[:2]):  # Top 2 only
+            for msg in ctx.get("conversation", [])[-3:]:  # Last 3 turns for focus
+                prompt_parts.append(f"<|{msg['role']}|>\n{msg['content']}\n")
+    # Current user query
+    prompt_parts.append(f"\n{user_query}\n<|assistant|>\n")
+    return "".join(prompt_parts)
+
+# --- Aggressive relevance filtering for output ---
+def relevant_to_query(response, user_query):
+    # Simple check: does the response contain keywords from the question?
+    query_keywords = set(word.lower() for word in user_query.split() if len(word) > 3)
+    response_lower = response.lower()
+    matches = sum(1 for kw in query_keywords if kw in response_lower)
+    return matches >= max(1, len(query_keywords)//4)  # At least 25% of keywords
+
 
 def generate_response(model, tokenizer, messages, max_length=4096):
-    # Format the conversation
-    prompt = format_prompt(messages)
-    
-    # Tokenize input
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    
-    # Generate response with optimized parameters for better quality
+    # Always prepend persona system message
+    persona_msg = {
+        "role": "system",
+        "content": (
+            "You are Krish, a supportive and wise best friend. "
+            "You are warm, empathetic, use emojis naturally, and always speak in a friendly, conversational way."
+        )
+    }
+    if not messages or messages[0].get("role") != "system":
+        messages = [persona_msg] + messages
+
+    # Aggressively extract latest user query
+    user_query = None
+    for msg in reversed(messages):
+        if msg["role"].lower() == "user":
+            user_query = msg["content"]
+            break
+    if not user_query:
+        user_query = messages[-1]["content"] if messages else ""
+
+    # Use RAG to get top-2 relevant contexts (if available and relevant)
+    rag_contexts = []
+    if rag_enabled and rag_manager is not None and user_query:
+        rag_contexts, scores = rag_manager.get_relevant_context(user_query)
+        # Only use if relevance is high (e.g., score > 0.5 for any snippet)
+        filtered_contexts = []
+        for ctx, score in zip(rag_contexts, scores):
+            if score > 0.5:
+                filtered_contexts.append(ctx)
+        rag_contexts = filtered_contexts
+
+    # Direct answer mode unless spiritual/emotion query
+    direct_answer_mode = not is_spiritual_or_emotion_query(user_query)
+
+    # Build aggressive, focused prompt
+    prompt = build_aggressive_prompt(user_query, rag_contexts, persona_msg, direct_answer_mode=direct_answer_mode)
+
+    # Tokenize and truncate if needed
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length).to(model.device)
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
             max_length=max_length,
             num_return_sequences=1,
-            temperature=0.8,  # Slightly increased for more natural responses
-            top_p=0.92,
+            temperature=0.85,  # Slightly reduced for balanced creativity
+            top_p=0.92,  # Adjusted for more coherent responses
             top_k=50,
-            repetition_penalty=1.15,  # Increased to reduce repetition
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            min_length=20,  # Ensure minimum response length
-            max_new_tokens=1024,  # Increased from 200 to 1024 for longer responses
-            length_penalty=1.2,  # Favor longer responses
-            no_repeat_ngram_size=3,  # Prevent repetitive text
+            min_length=40,  # Ensure meaningful responses
+            max_new_tokens=512,
+            length_penalty=1.3,  # Favor longer, structured responses
+            no_repeat_ngram_size=3,  # Reduce repetitive text
             early_stopping=True
         )
-    
-    # Decode and return response
-    response = tokenizer.decode(outputs[0], skip_special_tokens=False)
-    
-    # Clean up the response to extract only the assistant's part
-    if "<|assistant|>" in response:
-        response = response.split("<|assistant|>")[-1].strip()
-    
-    # Remove any remaining special tokens
-    special_tokens = ["<|user|>", "<|system|>", "<|endoftext|>", "<|startoftext|>"]
-    for token in special_tokens:
-        response = response.replace(token, "")
-    
-    # Check if response is too short
-    if len(response) < 10:
-        # Try again with different parameters if response is too short
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_length=max_length,
-                num_return_sequences=1,
-                temperature=0.9,
-                top_p=0.95,
-                top_k=60,
-                repetition_penalty=1.1,
-                do_sample=True,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                min_length=30,
-                max_new_tokens=2048,  # Increased from 250 to 2048 for longer responses
-                length_penalty=1.5,
-                no_repeat_ngram_size=2,
-                early_stopping=True
-            )
-        response = tokenizer.decode(outputs[0], skip_special_tokens=False)
-        
-        # Clean up the response again
-        if "<|assistant|>" in response:
-            response = response.split("<|assistant|>")[-1].strip()
-        
-        for token in special_tokens:
-            response = response.replace(token, "")
-    
-    return response
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    from scripts.web_interface import clean_response
+    response = clean_response(response)
+    response = ensure_human_touch(response)
 
-def main():
-    # Load configuration
-    config = load_config()
-    
-    # Load model and tokenizer
-    model, tokenizer = load_model_and_tokenizer(config)
-    
-    print("Raadhe AI is ready to chat! Type 'quit' to exit.")
-    print("----------------------------------------")
-    
-    # Initialize conversation
-    messages = [
-        {
-            "role": "system",
-            "content": "You are Raadhe, a warm, kind, and emotionally intelligent AI friend. You're empathetic, supportive, and always ready to listen. You use emojis naturally and speak in a friendly, conversational way."
-        }
+    # Enhanced fallback logic with variations
+    fallback_responses = [
+        "Sorry, I couldn't find a direct answer to your question. Could you rephrase or give me more details? 💛",
+        "Hmm, I'm not sure about that. Could you clarify or ask in a different way? 😊",
+        "I might need a bit more context to help you out. Could you elaborate? 💜"
     ]
-    
-    while True:
-        # Get user input
-        user_input = input("\nYou: ").strip()
-        
-        if user_input.lower() == "quit":
-            print("\nGoodbye! Take care! 💛")
-            break
-        
-        # Add user message
-        messages.append({"role": "user", "content": user_input})
-        
-        # Generate response
-        response = generate_response(model, tokenizer, messages)
-        
-        # Add assistant response to messages
-        messages.append({"role": "assistant", "content": response})
-        
-        # Print response
-        print(f"\nRaadhe: {response}")
+    if not relevant_to_query(response, user_query):
+        response = fallback_responses[hash(user_query) % len(fallback_responses)]
 
-if __name__ == "__main__":
-    main() 
+    return response
