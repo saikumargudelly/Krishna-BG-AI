@@ -3,6 +3,8 @@ import os
 import logging
 from functools import lru_cache
 from typing import Optional, Tuple, Dict, Any, List, TYPE_CHECKING
+import json
+import random
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -10,7 +12,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 import yaml
-import json
 import gradio as gr
 import re
 from sentence_transformers import SentenceTransformer, util
@@ -43,19 +44,41 @@ device = (
     "cpu"
 )
 
-# --- Sloka augmentation stubs (replace with your real logic if needed) ---
+# --- Load Gita Slokas for Context-Aware Augmentation ---
+SLOKA_LIST = []
+SLOKA_PATH = os.path.join("data", "gita_slokas.json")
+if os.path.exists(SLOKA_PATH):
+    with open(SLOKA_PATH, "r", encoding="utf-8") as f:
+        SLOKA_LIST = json.load(f)
+else:
+    print(f"Warning: {SLOKA_PATH} not found. Sloka augmentation will not work.")
+
+# --- Improved Emotion/Tag Detection ---
 def detect_emotion(message: str) -> str:
-    # Dummy: always returns 'neutral'
+    msg = message.lower()
+    if any(word in msg for word in ["sad", "down", "depressed", "unhappy"]):
+        return "sad"
+    if any(word in msg for word in ["angry", "mad", "frustrated"]):
+        return "angry"
+    if any(word in msg for word in ["happy", "joy", "excited"]):
+        return "happy"
+    if any(word in msg for word in ["stress", "anxiety", "worried"]):
+        return "stress"
+    if any(word in msg for word in ["motivate", "inspire", "encourage"]):
+        return "motivation"
+    if any(word in msg for word in ["work", "duty", "action"]):
+        return "duty"
+    # Add more as needed
     return "neutral"
 
+# --- Context-Aware Sloka Selection ---
 def get_relevant_sloka(emotion: str) -> dict:
-    # Dummy: always returns a sample sloka
-    return {
-        'chapter': '2',
-        'verse': '47',
-        'sloka': 'Karmanye vadhikaraste ma phaleshu kadachana',
-        'meaning': 'You have the right to work, but never to the fruit of work.'
-    }
+    # Only consider dicts
+    matches = [sloka for sloka in SLOKA_LIST if isinstance(sloka, dict) and emotion in sloka.get("tags", [])]
+    if matches:
+        return random.choice(matches)
+    fallback = [sloka for sloka in SLOKA_LIST if isinstance(sloka, dict)]
+    return random.choice(fallback) if fallback else None
 
 def final_response(message: str, model_response: str) -> str:
     # Dummy: just returns the model response
@@ -256,6 +279,8 @@ def generate_response(
             )
         response = model_manager.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
         cleaned_response = clean_response(response)
+        if not cleaned_response or not isinstance(cleaned_response, str):
+            return "I apologize, but I encountered an error while generating a response. Please try again."
         return cleaned_response
     except Exception as e:
         logging.error(f"Error generating response: {str(e)}")
@@ -286,15 +311,19 @@ def chat(message: str, history: List[Tuple[str, str]], system_prompt: str = None
             rag_manager=rag_manager
         )
         # Sloka augmentation
-        emotion_tag = detect_emotion(message)
-        sloka = get_relevant_sloka(emotion_tag)
-        if sloka:
-            meaning = sloka.get('meaning', '')
-            if len(meaning) > 300:
-                meaning = meaning[:300] + '...'
-            sloka_text = f"Sloka {sloka.get('chapter', '?')}.{sloka.get('verse', '?')}\n{sloka.get('sloka', '')}\nMeaning: {meaning}"
-        else:
-            sloka_text = "(No relevant sloka found for your emotion, but I'm here for you!)"
+        try:
+            emotion_tag = detect_emotion(message)
+            sloka = get_relevant_sloka(emotion_tag)
+            if isinstance(sloka, dict):
+                meaning = sloka.get('meaning', '')
+                if len(meaning) > 300:
+                    meaning = meaning[:300] + '...'
+                sloka_text = f"Sloka {sloka.get('chapter', '?')}.{sloka.get('verse', '?')}\n{sloka.get('sloka', '')}\nMeaning: {meaning}"
+            else:
+                sloka_text = "(No relevant sloka found for your emotion, but I'm here for you!)"
+        except Exception as e:
+            logging.error(f"Error in sloka augmentation: {str(e)}")
+            sloka_text = "(No sloka available)"
         return response, sloka_text
     except Exception as e:
         logging.error(f"Error in chat: {str(e)}")
