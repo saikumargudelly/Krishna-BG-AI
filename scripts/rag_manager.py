@@ -29,8 +29,31 @@ class RAGManager:
         self.index = None
         self.contexts = []
         self.dimension = self.model.get_sentence_embedding_dimension()
+        self.cache_dir = "cache"
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.index_path = os.path.join(self.cache_dir, "faiss.index")
+        self.emb_path = os.path.join(self.cache_dir, "embeddings.npy")
         self.load_training_data()
         
+    def build_faiss_index(self, embeddings):
+        dim = embeddings.shape[1]
+        index = faiss.IndexFlatL2(dim)
+        index.add(embeddings.astype('float32'))
+        return index
+
+    def save_faiss_index(self):
+        if self.index is not None:
+            faiss.write_index(self.index, self.index_path)
+        if self.embeddings is not None:
+            np.save(self.emb_path, self.embeddings)
+
+    def load_faiss_index(self):
+        if os.path.exists(self.index_path) and os.path.exists(self.emb_path):
+            self.index = faiss.read_index(self.index_path)
+            self.embeddings = np.load(self.emb_path)
+            return True
+        return False
+
     def load_training_data(self):
         """Load and process training data from JSON file."""
         try:
@@ -79,6 +102,11 @@ class RAGManager:
                 logging.error("No valid training data found")
                 return
             
+            # Try to load FAISS index and embeddings from disk
+            if self.load_faiss_index():
+                logging.info(f"Loaded FAISS index and embeddings from disk: {self.index_path}")
+                return
+            
             # Pre-compute embeddings for all conversations
             conversation_texts = []
             for item in self.training_data:
@@ -94,39 +122,41 @@ class RAGManager:
                 all_embeddings.append(batch_embeddings)
             
             self.embeddings = np.vstack(all_embeddings)
-            self._build_index()
-            logging.info(f"Successfully loaded {len(self.training_data)} training examples")
+            self.index = self.build_faiss_index(self.embeddings)
+            self.save_faiss_index()
+            logging.info(f"Successfully built and saved FAISS index with {len(self.training_data)} examples")
             
         except json.JSONDecodeError as e:
             logging.error(f"Invalid JSON in training data file: {e}")
             self.training_data = []
             self.embeddings = None
+            self.index = None
         except Exception as e:
             logging.error(f"Failed to load training data: {e}")
             self.training_data = []
             self.embeddings = None
+            self.index = None
 
     def find_similar_conversations(self, query: str, top_k: int = 3, threshold: float = 0.5) -> List[Dict]:
         """Find most similar conversations to the query."""
-        if self.embeddings is None or len(self.training_data) == 0:
+        if self.embeddings is None or self.index is None or len(self.training_data) == 0:
             return []
             
         # Compute query embedding
         query_embedding = self.model.encode([query], convert_to_numpy=True)
         
         # Calculate similarities
-        similarities = cosine_similarity(query_embedding, self.embeddings)[0]
-        
-        # Get top-k similar conversations
-        top_indices = np.argsort(similarities)[-top_k:][::-1]
+        D, I = self.index.search(query_embedding.astype('float32'), top_k)
         
         similar_conversations = []
-        for idx in top_indices:
-            if similarities[idx] > threshold:
-                similar_conversations.append({
-                    "conversation": self.training_data[idx],
-                    "similarity": float(similarities[idx])
-                })
+        for idx, dist in zip(I[0], D[0]):
+            if idx < len(self.training_data):
+                similarity = 1 / (1 + dist)  # Convert L2 distance to similarity
+                if similarity > threshold:
+                    similar_conversations.append({
+                        "conversation": self.training_data[idx],
+                        "similarity": float(similarity)
+                    })
         
         return similar_conversations
 

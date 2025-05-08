@@ -70,24 +70,56 @@ def build_aggressive_prompt(user_query, rag_contexts, persona_msg, direct_answer
     else:
         persona = persona_msg['content']
     prompt_parts.append(f"<|system|>\n{persona}\n")
-    # Explicit RAG context block (only if relevant and available)
+    
+    # Enhanced RAG context block with relevance scoring
     if rag_contexts:
-        prompt_parts.append("<|system|>\nHere are some previous conversations that may help answer the user's question:\n")
-        for idx, ctx in enumerate(rag_contexts[:2]):  # Top 2 only
-            for msg in ctx.get("conversation", [])[-3:]:  # Last 3 turns for focus
-                prompt_parts.append(f"<|{msg['role']}|>\n{msg['content']}\n")
-    # Current user query
-    prompt_parts.append(f"\n{user_query}\n<|assistant|>\n")
+        prompt_parts.append("<|system|>\nHere are some relevant previous conversations that may help:\n")
+        for idx, ctx in enumerate(rag_contexts[:3]):  # Increased to top 3 contexts
+            relevance_score = ctx.get("score", 0)
+            if relevance_score > 0.6:  # Only include highly relevant contexts
+                for msg in ctx.get("conversation", [])[-4:]:  # Increased to last 4 turns
+                    prompt_parts.append(f"<|{msg['role']}|>\n{msg['content']}\n")
+    
+    # Add current user query with context
+    prompt_parts.append(f"\n<|user|>\n{user_query}\n<|assistant|>\n")
     return "".join(prompt_parts)
 
 # --- Aggressive relevance filtering for output ---
 def relevant_to_query(response, user_query):
-    # Simple check: does the response contain keywords from the question?
+    # Enhanced relevance checking
     query_keywords = set(word.lower() for word in user_query.split() if len(word) > 3)
     response_lower = response.lower()
-    matches = sum(1 for kw in query_keywords if kw in response_lower)
-    return matches >= max(1, len(query_keywords)//4)  # At least 25% of keywords
+    
+    # Check for keyword matches
+    keyword_matches = sum(1 for kw in query_keywords if kw in response_lower)
+    
+    # Check for semantic similarity using basic heuristics
+    semantic_matches = 0
+    for kw in query_keywords:
+        if any(syn in response_lower for syn in get_synonyms(kw)):
+            semantic_matches += 1
+    
+    # Calculate total relevance score
+    total_matches = keyword_matches + (semantic_matches * 0.5)
+    required_matches = max(2, len(query_keywords) // 3)  # At least 33% of keywords
+    
+    return total_matches >= required_matches
 
+def get_synonyms(word):
+    # Basic synonym mapping for common words
+    synonym_map = {
+        'happy': ['joy', 'delighted', 'cheerful', 'glad'],
+        'sad': ['unhappy', 'depressed', 'gloomy', 'miserable'],
+        'angry': ['furious', 'enraged', 'irritated', 'annoyed'],
+        'love': ['adore', 'cherish', 'affection', 'care'],
+        'help': ['assist', 'support', 'aid', 'guide'],
+        'understand': ['comprehend', 'grasp', 'know', 'realize'],
+        'think': ['believe', 'consider', 'feel', 'suppose'],
+        'want': ['desire', 'wish', 'need', 'crave'],
+        'good': ['great', 'excellent', 'wonderful', 'fantastic'],
+        'bad': ['poor', 'terrible', 'awful', 'horrible']
+    }
+    return synonym_map.get(word.lower(), [])
 
 def generate_response(model, tokenizer, messages, max_length=4096):
     # Always prepend persona system message
